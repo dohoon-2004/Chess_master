@@ -1,3 +1,0 @@
-streamlit>=1.31
-python-chess>=1.999
-pandas>=2.0
