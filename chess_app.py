@@ -1395,6 +1395,190 @@ def build_free_review(current_infos: list[dict[str, Any]], board_after: chess.Bo
     }
     st.session_state.free_pending_review = None
 
+
+def load_game_into_pgn_state(game: chess.pgn.Game, game_index: int | None = None) -> None:
+    """선택한 PGN 메인라인을 클릭 가능한 편집 상태로 복사합니다."""
+    start_board = game.board()
+    board = start_board.copy(stack=False)
+    moves_uci: list[str] = []
+
+    for move in game.mainline_moves():
+        if move not in board.legal_moves:
+            break
+        moves_uci.append(move.uci())
+        board.push(move)
+
+    st.session_state.pgn_start_fen = start_board.fen()
+    st.session_state.pgn_moves = moves_uci
+    st.session_state.pgn_headers = dict(game.headers)
+    st.session_state.ply = 0
+    st.session_state.pgn_selected_square = None
+    st.session_state.pgn_processed_click_id = None
+    st.session_state.pgn_message = "PGN을 불러왔습니다. 어느 수순에서든 새 수를 둘 수 있습니다."
+    st.session_state.pgn_loaded_game_index = game_index
+    st.session_state.full_analysis = None
+    st.session_state.full_analysis_game = None
+
+
+def pgn_position_history() -> tuple[list[chess.Board], list[chess.Move], list[str]]:
+    """현재 편집 중인 PGN 메인라인의 포지션·수·SAN을 반환합니다."""
+    try:
+        board = chess.Board(st.session_state.pgn_start_fen)
+    except ValueError:
+        board = chess.Board()
+        st.session_state.pgn_start_fen = chess.STARTING_FEN
+
+    boards = [board.copy(stack=False)]
+    moves: list[chess.Move] = []
+    sans: list[str] = []
+    valid_moves: list[str] = []
+
+    for uci in st.session_state.get("pgn_moves", []):
+        try:
+            move = chess.Move.from_uci(uci)
+        except ValueError:
+            break
+        if move not in board.legal_moves:
+            break
+        sans.append(board.san(move))
+        moves.append(move)
+        board.push(move)
+        boards.append(board.copy(stack=False))
+        valid_moves.append(uci)
+
+    if valid_moves != st.session_state.get("pgn_moves", []):
+        st.session_state.pgn_moves = valid_moves
+
+    return boards, moves, sans
+
+
+def pgn_game_from_state() -> chess.pgn.Game:
+    """편집·분기된 현재 PGN 상태를 python-chess Game으로 다시 만듭니다."""
+    start_board = chess.Board(st.session_state.pgn_start_fen)
+    game = chess.pgn.Game()
+    game.setup(start_board)
+
+    for key, value in dict(st.session_state.get("pgn_headers", {})).items():
+        game.headers[key] = value
+    game.headers.setdefault("Event", "Imported PGN")
+    game.headers.setdefault("White", "White")
+    game.headers.setdefault("Black", "Black")
+    game.headers["Result"] = "*"
+
+    node = game
+    board = start_board.copy(stack=False)
+    for uci in st.session_state.get("pgn_moves", []):
+        move = chess.Move.from_uci(uci)
+        if move not in board.legal_moves:
+            break
+        node = node.add_variation(move)
+        board.push(move)
+    return game
+
+
+def make_pgn_move(board: chess.Board, to_square: int, promotion_piece: int) -> bool:
+    """PGN 복기 보드에서도 잠금 없이 선택·착수·수순 분기를 처리합니다."""
+    selected = st.session_state.pgn_selected_square
+    if selected is None:
+        piece = board.piece_at(to_square)
+        if piece is not None and piece.color == board.turn:
+            st.session_state.pgn_selected_square = to_square
+        return False
+
+    if to_square == selected:
+        st.session_state.pgn_selected_square = None
+        return False
+
+    clicked_piece = board.piece_at(to_square)
+    if clicked_piece is not None and clicked_piece.color == board.turn:
+        st.session_state.pgn_selected_square = to_square
+        return False
+
+    moving_piece = board.piece_at(selected)
+    promotion = None
+    if (
+        moving_piece is not None
+        and moving_piece.piece_type == chess.PAWN
+        and chess.square_rank(to_square) in (0, 7)
+    ):
+        promotion = promotion_piece
+
+    move = chess.Move(selected, to_square, promotion=promotion)
+    if move not in board.legal_moves:
+        st.session_state.pgn_message = "그 수는 둘 수 없습니다."
+        st.session_state.pgn_selected_square = None
+        return False
+
+    san = board.san(move)
+    branch_ply = max(0, min(int(st.session_state.ply), len(st.session_state.pgn_moves)))
+    branched = branch_ply < len(st.session_state.pgn_moves)
+    if branched:
+        st.session_state.pgn_moves = st.session_state.pgn_moves[:branch_ply]
+
+    st.session_state.pgn_moves.append(move.uci())
+    st.session_state.ply = len(st.session_state.pgn_moves)
+    st.session_state.pgn_selected_square = None
+    st.session_state.pgn_headers["Result"] = "*"
+    st.session_state.pgn_message = (
+        f"{san} 착수 · 이 위치부터 이후 수순을 새 변형으로 교체했습니다."
+        if branched
+        else f"{san} 착수"
+    )
+    st.session_state.full_analysis = None
+    st.session_state.full_analysis_game = None
+    return True
+
+
+def render_pgn_clickable_board(
+    board: chess.Board,
+    orientation: chess.Color,
+    promotion_piece: int,
+    last_move: chess.Move | None = None,
+) -> None:
+    """직접 두기와 완전히 같은 초록·아이보리 클릭식 보드를 PGN에도 사용합니다."""
+    selected = st.session_state.pgn_selected_square
+    legal_targets: set[int] = set()
+    if selected is not None:
+        legal_targets = {
+            move.to_square
+            for move in board.legal_moves
+            if move.from_square == selected
+        }
+
+    click = clickable_chessboard(
+        fen=board.fen(),
+        pieces=board_payload(board),
+        orientation="white" if orientation == chess.WHITE else "black",
+        turn="white" if board.turn == chess.WHITE else "black",
+        selected=chess.square_name(selected) if selected is not None else "",
+        legal_targets=[chess.square_name(square) for square in sorted(legal_targets)],
+        last_move=(
+            [
+                chess.square_name(last_move.from_square),
+                chess.square_name(last_move.to_square),
+            ]
+            if last_move is not None
+            else []
+        ),
+        interactive=True,
+        key="pgn_clickable_chessboard",
+        default=None,
+    )
+
+    if not isinstance(click, dict):
+        return
+
+    click_id = str(click.get("id", ""))
+    square_name = str(click.get("square", ""))
+    if not click_id or click_id == st.session_state.pgn_processed_click_id:
+        return
+    if square_name not in chess.SQUARE_NAMES:
+        return
+
+    st.session_state.pgn_processed_click_id = click_id
+    make_pgn_move(board, chess.parse_square(square_name), promotion_piece)
+    st.rerun()
+
 def init_state() -> None:
     defaults = {
         "games": [],
@@ -1415,6 +1599,13 @@ def init_state() -> None:
         "free_processed_click_id": None,
         "free_view_ply": 0,
         "position_analysis_cache": {},
+        "pgn_start_fen": chess.STARTING_FEN,
+        "pgn_moves": [],
+        "pgn_headers": {},
+        "pgn_selected_square": None,
+        "pgn_processed_click_id": None,
+        "pgn_message": "",
+        "pgn_loaded_game_index": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1428,7 +1619,7 @@ init_state()
 # 제목
 # -----------------------------
 st.title("♟️ Stockfish Chess Review")
-st.caption("직접 수를 두면서 실시간 Stockfish 분석을 받거나, PGN 게임 전체를 복기합니다.")
+st.caption("직접 두기와 PGN 복기 모두 같은 클릭식 체스판을 사용하며, 과거 수순에서도 잠금 없이 새 변형을 둘 수 있습니다.")
 
 
 # -----------------------------
@@ -1644,43 +1835,54 @@ with play_tab:
                         st.markdown(f"- {reason}")
 
 with input_tab:
-    uploaded = st.file_uploader(
-        "PGN 파일 업로드",
-        type=["pgn"],
-        accept_multiple_files=False,
-    )
+    st.caption("파일을 고르거나 PGN을 붙여넣은 뒤 아래 ‘PGN 불러오기’ 버튼을 눌러야 적용됩니다.")
 
-    pgn_text = st.text_area(
-        "또는 PGN 텍스트 붙여넣기",
-        height=120,
-        placeholder='[Event "..."]\n[White "..."]\n[Black "..."]\n\n1. e4 e5 2. Nf3 Nc6 ...',
-    )
+    with st.form("pgn_load_form", clear_on_submit=False):
+        uploaded = st.file_uploader(
+            "PGN 파일 업로드",
+            type=["pgn"],
+            accept_multiple_files=False,
+        )
 
-    raw: bytes | None = None
-    source_id: tuple[str, int] | None = None
+        pgn_text = st.text_area(
+            "또는 PGN 텍스트 붙여넣기",
+            height=150,
+            placeholder='[Event "..."]\n[White "..."]\n[Black "..."]\n\n1. e4 e5 2. Nf3 Nc6 ...',
+        )
 
-    if uploaded is not None:
-        raw = uploaded.getvalue()
-        source_id = (uploaded.name, hash(raw))
-    elif pgn_text.strip():
-        raw = pgn_text.encode("utf-8")
-        source_id = ("pasted_pgn", hash(raw))
+        load_pgn_clicked = st.form_submit_button(
+            "📥 PGN 불러오기",
+            type="primary",
+            use_container_width=True,
+        )
 
-    if raw is not None and source_id != st.session_state.source_id:
-        try:
-            parsed = parse_pgn_bytes(raw)
-            if not parsed:
-                st.error("유효한 게임을 PGN에서 찾지 못했습니다.")
-            else:
-                st.session_state.games = parsed
-                st.session_state.source_id = source_id
-                st.session_state.selected_game = 0
-                st.session_state.ply = 0
-                st.session_state.full_analysis = None
-                st.session_state.full_analysis_game = None
-                st.success(f"{len(parsed)}개 게임을 불러왔습니다.")
-        except Exception as exc:
-            st.error(f"PGN 파싱 실패: {exc}")
+    if load_pgn_clicked:
+        raw: bytes | None = None
+        source_id: tuple[str, int] | None = None
+
+        if uploaded is not None:
+            raw = uploaded.getvalue()
+            source_id = (uploaded.name, hash(raw))
+        elif pgn_text.strip():
+            raw = pgn_text.encode("utf-8")
+            source_id = ("pasted_pgn", hash(raw))
+
+        if raw is None:
+            st.warning("PGN 파일을 선택하거나 PGN 텍스트를 붙여넣으세요.")
+        else:
+            try:
+                parsed = parse_pgn_bytes(raw)
+                if not parsed:
+                    st.error("유효한 게임을 PGN에서 찾지 못했습니다.")
+                else:
+                    st.session_state.games = parsed
+                    st.session_state.source_id = source_id
+                    st.session_state.selected_game = 0
+                    load_game_into_pgn_state(parsed[0], game_index=0)
+                    st.success(f"{len(parsed)}개 게임을 불러왔습니다.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"PGN 파싱 실패: {exc}")
 
 with fen_tab:
     fen_text = st.text_input(
@@ -1700,9 +1902,7 @@ with fen_tab:
             st.session_state.games = [game]
             st.session_state.source_id = ("fen", hash(fen_text.strip()))
             st.session_state.selected_game = 0
-            st.session_state.ply = 0
-            st.session_state.full_analysis = None
-            st.session_state.full_analysis_game = None
+            load_game_into_pgn_state(game, game_index=0)
             st.rerun()
         except ValueError as exc:
             st.error(f"FEN 오류: {exc}")
@@ -1727,17 +1927,18 @@ selected_game = st.selectbox(
 
 if selected_game != st.session_state.selected_game:
     st.session_state.selected_game = selected_game
-    st.session_state.ply = 0
-    st.session_state.full_analysis = None
-    st.session_state.full_analysis_game = None
+    load_game_into_pgn_state(games[selected_game], game_index=selected_game)
     st.rerun()
 
-game = games[selected_game]
-positions, moves, sans = game_positions(game)
-max_ply = len(moves)
-st.session_state.ply = min(st.session_state.ply, max_ply)
+if st.session_state.pgn_loaded_game_index != selected_game:
+    load_game_into_pgn_state(games[selected_game], game_index=selected_game)
 
-headers = game.headers
+game = pgn_game_from_state()
+positions, moves, sans = pgn_position_history()
+max_ply = len(moves)
+st.session_state.ply = max(0, min(st.session_state.ply, max_ply))
+
+headers = st.session_state.pgn_headers or game.headers
 meta1, meta2, meta3, meta4 = st.columns(4)
 meta1.metric("White", headers.get("White", "White"))
 meta2.metric("Black", headers.get("Black", "Black"))
@@ -1761,14 +1962,32 @@ with board_col:
             st.caption(f"현재 수순 자동 평가는 계산하지 못했습니다: {exc}")
 
     render_evaluation_bar(pgn_infos, ply, max_ply, depth)
-    render_board(board, last_move, orientation)
+
+    if ply < max_ply:
+        st.markdown(
+            '<div class="reviewing-note">과거 수순입니다. 체스판은 잠겨 있지 않습니다. 여기서 새 수를 두면 이후 수순이 삭제되고 새 변형으로 이어집니다.</div>',
+            unsafe_allow_html=True,
+        )
+
+    render_pgn_clickable_board(
+        board,
+        orientation,
+        promotion_piece,
+        last_move=last_move,
+    )
+    render_move_strip(sans, ply)
+
+    if st.session_state.pgn_message:
+        st.caption(st.session_state.pgn_message)
 
     b1, b2, b3, b4, b5 = st.columns(5)
     if b1.button("⏮", use_container_width=True, disabled=ply == 0):
         st.session_state.ply = 0
+        st.session_state.pgn_selected_square = None
         st.rerun()
     if b2.button("◀", use_container_width=True, disabled=ply == 0):
         st.session_state.ply -= 1
+        st.session_state.pgn_selected_square = None
         st.rerun()
     b3.markdown(
         f"<div style='text-align:center;padding-top:8px'><b>{ply} / {max_ply}</b></div>",
@@ -1776,9 +1995,11 @@ with board_col:
     )
     if b4.button("▶", use_container_width=True, disabled=ply == max_ply):
         st.session_state.ply += 1
+        st.session_state.pgn_selected_square = None
         st.rerun()
     if b5.button("⏭", use_container_width=True, disabled=ply == max_ply):
         st.session_state.ply = max_ply
+        st.session_state.pgn_selected_square = None
         st.rerun()
 
     slider_ply = st.slider(
@@ -1791,6 +2012,7 @@ with board_col:
     )
     if slider_ply != st.session_state.ply:
         st.session_state.ply = slider_ply
+        st.session_state.pgn_selected_square = None
         st.rerun()
 
     if ply == 0:
@@ -1800,6 +2022,17 @@ with board_col:
         move_no = move_board.fullmove_number
         prefix = f"{move_no}." if move_board.turn == chess.WHITE else f"{move_no}..."
         st.markdown(f"### 현재 수: `{prefix} {sans[ply - 1]}`")
+
+    exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)
+    edited_pgn_text = game.accept(exporter)
+    st.download_button(
+        "수정된 PGN 저장",
+        data=edited_pgn_text.encode("utf-8"),
+        file_name="edited_game.pgn",
+        mime="application/x-chess-pgn",
+        use_container_width=True,
+        key="download_edited_pgn",
+    )
 
 with review_col:
     st.subheader("🔬 현재 포지션 분석")
@@ -1861,7 +2094,7 @@ with review_col:
     st.subheader("📝 기보")
     if sans:
         tokens: list[str] = []
-        temp = game.board()
+        temp = chess.Board(st.session_state.pgn_start_fen)
 
         for idx, san in enumerate(sans):
             if temp.turn == chess.WHITE:
