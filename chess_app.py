@@ -58,6 +58,7 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
       margin: 0;
       padding: 0;
       background: transparent;
+      overflow: hidden;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
@@ -182,6 +183,63 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
       cursor: default;
     }
 
+    .promotion-layer {
+      position: absolute;
+      inset: 0;
+      z-index: 40;
+      display: none;
+    }
+
+    .promotion-layer.open { display: block; }
+
+    .promotion-backdrop {
+      position: absolute;
+      inset: 0;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      background: rgba(0, 0, 0, 0.12);
+      cursor: pointer;
+    }
+
+    .promotion-menu {
+      position: absolute;
+      width: 12.5%;
+      height: 50%;
+      display: grid;
+      grid-template-rows: repeat(4, 1fr);
+      background: #f2f2f2;
+      box-shadow: 0 3px 18px rgba(0, 0, 0, 0.42);
+      z-index: 42;
+      overflow: hidden;
+    }
+
+    .promotion-option {
+      appearance: none;
+      border: 0;
+      border-radius: 0;
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #f2f2f2;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .promotion-option:nth-child(even) { background: #dedede; }
+    .promotion-option:hover { filter: brightness(0.92); }
+
+    .promotion-option img {
+      width: 92%;
+      height: 92%;
+      object-fit: contain;
+      pointer-events: none;
+      filter: drop-shadow(0 2px 1px rgba(0,0,0,.28));
+    }
+
     .review-badge {
       position: absolute;
       left: 50%;
@@ -205,8 +263,12 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <main class="wrap">
+  <main class="wrap" style="position:relative;">
     <div id="board" class="board" aria-label="Clickable chess board"></div>
+    <div id="promotionLayer" class="promotion-layer" aria-hidden="true">
+      <button id="promotionBackdrop" class="promotion-backdrop" type="button" aria-label="프로모션 선택 취소"></button>
+      <div id="promotionMenu" class="promotion-menu" role="dialog" aria-label="프로모션 기물 선택"></div>
+    </div>
   </main>
 
   <script>
@@ -218,14 +280,71 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
     }
 
     function setFrameHeight() {
-      const height = document.documentElement.scrollHeight || document.body.scrollHeight || 640;
-      streamlitPost("streamlit:setFrameHeight", { height });
+      const board = document.getElementById("board");
+      const width = board ? board.getBoundingClientRect().width : 0;
+      if (!width) return;
+      const size = Math.ceil(width);
+      document.documentElement.style.height = `${size}px`;
+      document.body.style.height = `${size}px`;
+      streamlitPost("streamlit:setFrameHeight", { height: size });
     }
 
-    function sendSquare(square) {
-      const id = `${Date.now()}-${square}-${Math.random().toString(36).slice(2)}`;
-      streamlitPost("streamlit:setComponentValue", { value: { square, id } });
+    function sendSquare(square, promotion = "") {
+      const id = `${Date.now()}-${square}-${promotion}-${Math.random().toString(36).slice(2)}`;
+      streamlitPost("streamlit:setComponentValue", { value: { square, promotion, id } });
     }
+
+    function hidePromotion() {
+      const layer = document.getElementById("promotionLayer");
+      const menu = document.getElementById("promotionMenu");
+      layer.classList.remove("open");
+      layer.setAttribute("aria-hidden", "true");
+      menu.innerHTML = "";
+    }
+
+    function showPromotion(square, orientation, promotionPieces) {
+      const layer = document.getElementById("promotionLayer");
+      const menu = document.getElementById("promotionMenu");
+      const files = orientation === "white" ? FILES : [...FILES].reverse();
+      const ranks = orientation === "white" ? [...RANKS].reverse() : RANKS;
+      const column = files.indexOf(square[0]);
+      const row = ranks.indexOf(square[1]);
+      const openDown = row <= 3;
+      const choices = ["q", "r", "b", "n"];
+      const visualChoices = openDown ? choices : [...choices].reverse();
+
+      menu.style.left = `${column * 12.5}%`;
+      menu.style.top = `${(openDown ? row : row - 3) * 12.5}%`;
+      menu.innerHTML = "";
+
+      for (const code of visualChoices) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "promotion-option";
+        option.setAttribute("aria-label", `프로모션 ${code}`);
+
+        const src = promotionPieces[code] || "";
+        if (src) {
+          const img = document.createElement("img");
+          img.src = src;
+          img.alt = code;
+          img.draggable = false;
+          option.appendChild(img);
+        }
+
+        option.addEventListener("click", (event) => {
+          event.stopPropagation();
+          hidePromotion();
+          sendSquare(square, code);
+        });
+        menu.appendChild(option);
+      }
+
+      layer.classList.add("open");
+      layer.setAttribute("aria-hidden", "false");
+    }
+
+    document.getElementById("promotionBackdrop").addEventListener("click", hidePromotion);
 
     function squareColorClass(square) {
       const fileIndex = FILES.indexOf(square[0]);
@@ -240,8 +359,11 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
       const selected = args.selected || "";
       const legalTargets = new Set(args.legal_targets || []);
       const lastMove = new Set(args.last_move || []);
+      const promotionTargets = new Set(args.promotion_targets || []);
+      const promotionPieces = args.promotion_pieces || {};
       const interactive = args.interactive !== false;
 
+      hidePromotion();
       board.classList.toggle("reviewing", !interactive);
 
       const files = orientation === "white" ? FILES : [...FILES].reverse();
@@ -302,7 +424,13 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
           }
 
           if (interactive) {
-            button.addEventListener("click", () => sendSquare(square));
+            button.addEventListener("click", () => {
+              if (promotionTargets.has(square)) {
+                showPromotion(square, orientation, promotionPieces);
+              } else {
+                sendSquare(square);
+              }
+            });
           } else {
             button.disabled = true;
           }
@@ -321,7 +449,10 @@ CHESSBOARD_COMPONENT_HTML = r"""<!doctype html>
     });
 
     streamlitPost("streamlit:componentReady", { apiVersion: 1 });
-    setFrameHeight();
+    const resizeObserver = new ResizeObserver(() => setFrameHeight());
+    resizeObserver.observe(document.getElementById("board"));
+    requestAnimationFrame(setFrameHeight);
+    setTimeout(setFrameHeight, 80);
   </script>
 </body>
 </html>
@@ -355,17 +486,26 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        .block-container {padding-top: 1.3rem; padding-bottom: 2rem;}
+        .block-container {padding-top: 0.9rem; padding-bottom: 1.4rem;}
         .small-muted {color: #8b949e; font-size: 0.88rem;}
+        iframe[title="clickable_chessboard"] {
+            display: block;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        div[data-testid="stCustomComponentV1"] {
+            margin-bottom: 0 !important;
+            padding-bottom: 0 !important;
+        }
         .review-box {
             border: 1px solid rgba(128,128,128,0.25);
             border-radius: 12px;
             padding: 14px 16px;
-            margin: 8px 0;
+            margin: 6px 0;
         }
         .eval-wrap {
             width: 100%;
-            margin: 0.15rem 0 0.9rem 0;
+            margin: 0.05rem 0 0.45rem 0;
         }
         .eval-bar {
             position: relative;
@@ -423,7 +563,7 @@ st.markdown(
             border: 1px solid rgba(255, 193, 7, .30);
             border-radius: 10px;
             padding: 9px 11px;
-            margin: 8px 0;
+            margin: 6px 0;
             font-weight: 700;
         }
         @media (max-width: 700px) {
@@ -1238,11 +1378,11 @@ def piece_image_uri(piece: chess.Piece) -> str:
     return uri
 
 
-PROMOTION_MAP = {
-    "퀸": chess.QUEEN,
-    "룩": chess.ROOK,
-    "비숍": chess.BISHOP,
-    "나이트": chess.KNIGHT,
+PROMOTION_SYMBOL_MAP = {
+    "q": chess.QUEEN,
+    "r": chess.ROOK,
+    "b": chess.BISHOP,
+    "n": chess.KNIGHT,
 }
 
 
@@ -1321,7 +1461,7 @@ def undo_free_move() -> bool:
     return True
 
 
-def make_free_move(board: chess.Board, to_square: int, promotion_piece: int) -> bool:
+def make_free_move(board: chess.Board, to_square: int, promotion_symbol: str = "") -> bool:
     selected = st.session_state.free_selected_square
     if selected is None:
         piece = board.piece_at(to_square)
@@ -1338,20 +1478,29 @@ def make_free_move(board: chess.Board, to_square: int, promotion_piece: int) -> 
         st.session_state.free_selected_square = to_square
         return False
 
-    moving_piece = board.piece_at(selected)
-    promotion = None
-    if (
-        moving_piece is not None
-        and moving_piece.piece_type == chess.PAWN
-        and chess.square_rank(to_square) in (0, 7)
-    ):
-        promotion = promotion_piece
-
-    move = chess.Move(selected, to_square, promotion=promotion)
-    if move not in board.legal_moves:
+    candidates = [
+        move for move in board.legal_moves
+        if move.from_square == selected and move.to_square == to_square
+    ]
+    if not candidates:
         st.session_state.free_message = "그 수는 둘 수 없습니다."
         st.session_state.free_selected_square = None
         return False
+
+    promotion_candidates = [move for move in candidates if move.promotion is not None]
+    if promotion_candidates:
+        promotion_type = PROMOTION_SYMBOL_MAP.get(promotion_symbol.lower())
+        if promotion_type is None:
+            # 선택창에서 기물을 고르기 전에는 실제 착수를 실행하지 않습니다.
+            return False
+        move = next(
+            (move for move in promotion_candidates if move.promotion == promotion_type),
+            None,
+        )
+        if move is None:
+            return False
+    else:
+        move = candidates[0]
 
     before_fen = board.fen()
     san = board.san(move)
@@ -1365,8 +1514,6 @@ def make_free_move(board: chess.Board, to_square: int, promotion_piece: int) -> 
         before_infos = list(st.session_state.free_infos)
         before_info = before_infos[0]
 
-    # 과거 수순에서 새 수를 두면 그 지점 이후의 기존 수순을 버리고
-    # 새로운 변형으로 이어갑니다. 체스 분석 앱의 일반적인 분기 동작입니다.
     branch_ply = max(0, min(
         int(st.session_state.get("free_view_ply", len(st.session_state.free_moves))),
         len(st.session_state.free_moves),
@@ -1406,21 +1553,35 @@ def board_payload(board: chess.Board) -> dict[str, str]:
     return pieces
 
 
+def promotion_piece_payload(color: chess.Color) -> dict[str, str]:
+    """폰이 마지막 랭크에 도착했을 때 보드 위 선택창에 표시할 기물입니다."""
+    return {
+        "q": piece_image_uri(chess.Piece(chess.QUEEN, color)),
+        "r": piece_image_uri(chess.Piece(chess.ROOK, color)),
+        "b": piece_image_uri(chess.Piece(chess.BISHOP, color)),
+        "n": piece_image_uri(chess.Piece(chess.KNIGHT, color)),
+    }
+
+
 def render_clickable_board(
     board: chess.Board,
     orientation: chess.Color,
-    promotion_piece: int,
     last_move: chess.Move | None = None,
     interactive: bool = True,
 ) -> None:
     """모바일에서도 깨지지 않는 단일 HTML 컴포넌트 체스판입니다."""
     selected = st.session_state.free_selected_square if interactive else None
     legal_targets: set[int] = set()
+    promotion_targets: set[int] = set()
     if selected is not None:
-        legal_targets = {
-            move.to_square
-            for move in board.legal_moves
+        selected_moves = [
+            move for move in board.legal_moves
             if move.from_square == selected
+        ]
+        legal_targets = {move.to_square for move in selected_moves}
+        promotion_targets = {
+            move.to_square for move in selected_moves
+            if move.promotion is not None
         }
 
     click = clickable_chessboard(
@@ -1430,6 +1591,8 @@ def render_clickable_board(
         turn="white" if board.turn == chess.WHITE else "black",
         selected=chess.square_name(selected) if selected is not None else "",
         legal_targets=[chess.square_name(square) for square in sorted(legal_targets)],
+        promotion_targets=[chess.square_name(square) for square in sorted(promotion_targets)],
+        promotion_pieces=promotion_piece_payload(board.turn),
         last_move=(
             [
                 chess.square_name(last_move.from_square),
@@ -1453,8 +1616,13 @@ def render_clickable_board(
     if square_name not in chess.SQUARE_NAMES:
         return
 
+    promotion_symbol = str(click.get("promotion", ""))
     st.session_state.free_processed_click_id = click_id
-    make_free_move(board, chess.parse_square(square_name), promotion_piece)
+    make_free_move(
+        board,
+        chess.parse_square(square_name),
+        promotion_symbol=promotion_symbol,
+    )
     st.rerun()
 
 
@@ -1586,7 +1754,7 @@ def pgn_game_from_state() -> chess.pgn.Game:
     return game
 
 
-def make_pgn_move(board: chess.Board, to_square: int, promotion_piece: int) -> bool:
+def make_pgn_move(board: chess.Board, to_square: int, promotion_symbol: str = "") -> bool:
     """PGN 복기 보드에서도 잠금 없이 선택·착수·수순 분기를 처리합니다."""
     selected = st.session_state.pgn_selected_square
     if selected is None:
@@ -1604,20 +1772,28 @@ def make_pgn_move(board: chess.Board, to_square: int, promotion_piece: int) -> b
         st.session_state.pgn_selected_square = to_square
         return False
 
-    moving_piece = board.piece_at(selected)
-    promotion = None
-    if (
-        moving_piece is not None
-        and moving_piece.piece_type == chess.PAWN
-        and chess.square_rank(to_square) in (0, 7)
-    ):
-        promotion = promotion_piece
-
-    move = chess.Move(selected, to_square, promotion=promotion)
-    if move not in board.legal_moves:
+    candidates = [
+        move for move in board.legal_moves
+        if move.from_square == selected and move.to_square == to_square
+    ]
+    if not candidates:
         st.session_state.pgn_message = "그 수는 둘 수 없습니다."
         st.session_state.pgn_selected_square = None
         return False
+
+    promotion_candidates = [move for move in candidates if move.promotion is not None]
+    if promotion_candidates:
+        promotion_type = PROMOTION_SYMBOL_MAP.get(promotion_symbol.lower())
+        if promotion_type is None:
+            return False
+        move = next(
+            (move for move in promotion_candidates if move.promotion == promotion_type),
+            None,
+        )
+        if move is None:
+            return False
+    else:
+        move = candidates[0]
 
     san = board.san(move)
     branch_ply = max(0, min(int(st.session_state.ply), len(st.session_state.pgn_moves)))
@@ -1642,17 +1818,21 @@ def make_pgn_move(board: chess.Board, to_square: int, promotion_piece: int) -> b
 def render_pgn_clickable_board(
     board: chess.Board,
     orientation: chess.Color,
-    promotion_piece: int,
     last_move: chess.Move | None = None,
 ) -> None:
     """직접 두기와 완전히 같은 초록·아이보리 클릭식 보드를 PGN에도 사용합니다."""
     selected = st.session_state.pgn_selected_square
     legal_targets: set[int] = set()
+    promotion_targets: set[int] = set()
     if selected is not None:
-        legal_targets = {
-            move.to_square
-            for move in board.legal_moves
+        selected_moves = [
+            move for move in board.legal_moves
             if move.from_square == selected
+        ]
+        legal_targets = {move.to_square for move in selected_moves}
+        promotion_targets = {
+            move.to_square for move in selected_moves
+            if move.promotion is not None
         }
 
     click = clickable_chessboard(
@@ -1662,6 +1842,8 @@ def render_pgn_clickable_board(
         turn="white" if board.turn == chess.WHITE else "black",
         selected=chess.square_name(selected) if selected is not None else "",
         legal_targets=[chess.square_name(square) for square in sorted(legal_targets)],
+        promotion_targets=[chess.square_name(square) for square in sorted(promotion_targets)],
+        promotion_pieces=promotion_piece_payload(board.turn),
         last_move=(
             [
                 chess.square_name(last_move.from_square),
@@ -1685,8 +1867,13 @@ def render_pgn_clickable_board(
     if square_name not in chess.SQUARE_NAMES:
         return
 
+    promotion_symbol = str(click.get("promotion", ""))
     st.session_state.pgn_processed_click_id = click_id
-    make_pgn_move(board, chess.parse_square(square_name), promotion_piece)
+    make_pgn_move(
+        board,
+        chess.parse_square(square_name),
+        promotion_symbol=promotion_symbol,
+    )
     st.rerun()
 
 def init_state() -> None:
@@ -1781,19 +1968,16 @@ play_tab, input_tab, fen_tab = st.tabs(["♟️ 직접 두기", "📂 PGN 불러
 
 with play_tab:
     st.subheader("♟️ 직접 두기 + 수순 복기 + 실시간 Stockfish")
-    st.caption("뒤로/앞으로 이동하면 해당 포지션의 점수가 표시됩니다. 과거 위치에서도 착수할 수 있으며, 그 경우 이후 수순은 새 변형으로 교체됩니다.")
+    st.caption("뒤로/앞으로 이동하면 해당 포지션의 점수가 표시됩니다. 폰이 마지막 랭크에 도착할 때만 체스판 위에 승진 기물 선택창이 나타납니다.")
 
-    control1, control2, control3, control4 = st.columns([1, 1, 1, 1])
+    control1, control2, control3 = st.columns([1, 1, 1])
     with control1:
         auto_analyse = st.toggle("매 수 자동 분석", value=True, key="free_auto_analyse")
     with control2:
-        promotion_name = st.selectbox("프로모션", list(PROMOTION_MAP), index=0)
-        promotion_piece = PROMOTION_MAP[promotion_name]
-    with control3:
         if st.button("↩ 한 수 취소", use_container_width=True, disabled=not st.session_state.free_moves):
             undo_free_move()
             st.rerun()
-    with control4:
+    with control3:
         if st.button("🔄 새 게임", use_container_width=True):
             st.session_state.free_moves = []
             st.session_state.free_view_ply = 0
@@ -1863,7 +2047,6 @@ with play_tab:
         render_clickable_board(
             free_board,
             orientation,
-            promotion_piece,
             last_move=free_last_move,
             interactive=True,
         )
@@ -2080,7 +2263,6 @@ with board_col:
     render_pgn_clickable_board(
         board,
         orientation,
-        promotion_piece,
         last_move=last_move,
     )
     render_move_strip(sans, ply)
