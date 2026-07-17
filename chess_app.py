@@ -563,6 +563,116 @@ def render_board(board: chess.Board, last_move: chess.Move | None, orientation: 
     )
 
 
+def render_pgn_copy_button(
+    pgn_text: str,
+    label: str = "📋 PGN 복사",
+    key: str = "pgn_copy",
+) -> None:
+    """사용자 클릭으로 현재 PGN 전체를 클립보드에 복사합니다."""
+    encoded = base64.b64encode(pgn_text.encode("utf-8")).decode("ascii")
+    safe_key = "".join(ch if ch.isalnum() else "_" for ch in key)
+
+    components.html(
+        f"""
+        <style>
+          html, body {{
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          }}
+          .copy-wrap {{ width: 100%; }}
+          .copy-btn {{
+            width: 100%;
+            min-height: 43px;
+            border: 1px solid rgba(49, 51, 63, 0.22);
+            border-radius: 0.5rem;
+            background: #ffffff;
+            color: #262730;
+            font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: border-color 120ms ease, background 120ms ease;
+          }}
+          .copy-btn:hover {{
+            border-color: #ff4b4b;
+            color: #ff4b4b;
+          }}
+          .copy-btn:active {{ background: #f6f6f6; }}
+          .copy-btn.copied {{
+            background: #e8f7ed;
+            border-color: #2e9d57;
+            color: #19743b;
+          }}
+          .copy-btn.failed {{
+            background: #fff0f0;
+            border-color: #d64545;
+            color: #b42323;
+          }}
+          @media (prefers-color-scheme: dark) {{
+            .copy-btn {{
+              background: #0e1117;
+              color: #fafafa;
+              border-color: rgba(250, 250, 250, 0.30);
+            }}
+            .copy-btn:active {{ background: #171b22; }}
+            .copy-btn.copied {{ background: #153322; color: #8ce5a9; }}
+            .copy-btn.failed {{ background: #3a1717; color: #ffaaaa; }}
+          }}
+        </style>
+        <div class="copy-wrap">
+          <button id="copy_{safe_key}" class="copy-btn" type="button">{html_lib.escape(label)}</button>
+        </div>
+        <script>
+          const button = document.getElementById("copy_{safe_key}");
+          const encoded = "{encoded}";
+          const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+          const pgnText = new TextDecoder("utf-8").decode(bytes);
+          const originalLabel = button.textContent;
+
+          async function copyPgn() {{
+            try {{
+              if (navigator.clipboard && window.isSecureContext) {{
+                await navigator.clipboard.writeText(pgnText);
+              }} else {{
+                const textarea = document.createElement("textarea");
+                textarea.value = pgnText;
+                textarea.setAttribute("readonly", "");
+                textarea.style.position = "fixed";
+                textarea.style.opacity = "0";
+                textarea.style.pointerEvents = "none";
+                document.body.appendChild(textarea);
+                textarea.focus();
+                textarea.select();
+                textarea.setSelectionRange(0, textarea.value.length);
+                const ok = document.execCommand("copy");
+                document.body.removeChild(textarea);
+                if (!ok) throw new Error("copy command failed");
+              }}
+
+              button.textContent = "✅ PGN 복사됨";
+              button.classList.remove("failed");
+              button.classList.add("copied");
+            }} catch (error) {{
+              button.textContent = "복사 실패 — 다시 눌러주세요";
+              button.classList.remove("copied");
+              button.classList.add("failed");
+            }}
+
+            window.setTimeout(() => {{
+              button.textContent = originalLabel;
+              button.classList.remove("copied", "failed");
+            }}, 1800);
+          }}
+
+          button.addEventListener("click", copyPgn);
+        </script>
+        """,
+        height=48,
+        scrolling=False,
+    )
+
+
 def score_cp(score: chess.engine.PovScore, pov: chess.Color) -> int:
     value = score.pov(pov).score(mate_score=MATE_SCORE)
     return 0 if value is None else int(value)
@@ -1780,12 +1890,10 @@ with play_tab:
         if st.session_state.free_message and at_latest:
             st.caption(st.session_state.free_message)
 
-        st.download_button(
-            "PGN 저장",
-            data=free_pgn_text().encode("utf-8"),
-            file_name="direct_game.pgn",
-            mime="application/x-chess-pgn",
-            use_container_width=True,
+        render_pgn_copy_button(
+            free_pgn_text(),
+            label="📋 PGN 복사",
+            key="direct_game_pgn_copy",
         )
 
     with free_analysis_col:
